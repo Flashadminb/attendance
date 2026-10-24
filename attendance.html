@@ -133,8 +133,9 @@ td.raw{font-size:12px;max-width:240px;overflow:hidden;text-overflow:ellipsis}
    ใส่ URL ของ Apps Script และรหัสลับ (TOKEN) ให้ตรงกับใน sheets-script/token.gs
    ถ้าใส่ไว้ ทุกเครื่องที่เปิดหน้านี้จะเชื่อมต่อ บันทึก และดึงข้อมูลจากชีตอัตโนมัติ ไม่ต้องกรอกเอง
    ⚠ ใครได้ไฟล์นี้หรือเปิดหน้าเว็บนี้ได้ จะเข้าถึงข้อมูลในชีตได้ทั้งหมด */
-const SHEETS_URL   = '';   // เช่น 'https://script.google.com/macros/s/AKfy..../exec'
-const SHEETS_TOKEN = '';   // รหัสลับเดียวกับ TOKEN ใน sheets-script/token.gs (ห้ามใส่ถ้า repo เป็นสาธารณะ)
+// URL เปิดเผยได้ (ไม่มีรหัสลับก็อ่าน/แก้ข้อมูลไม่ได้) · แต่ละเครื่องกรอกรหัสลับครั้งแรกครั้งเดียว
+const SHEETS_URL   = 'https://script.google.com/macros/s/AKfycbyiO8LuaI20Iuaem8kPE2o_ZMWv40axuq59VG2GXPpgFfIVCKtUBTu6M1uVgGcGkW8-/exec';
+const SHEETS_TOKEN = '';   // ห้ามใส่ เพราะ repo เป็นสาธารณะ (รหัสลับอยู่ใน sheets-script/token.gs)
 
 /* ================= ค่าเริ่มต้น ================= */
 const DEFAULTS = {
@@ -220,14 +221,16 @@ async function boot() {
   CFG = mergeCfg(await get(K.cfg, null));
   EMP = await get(K.emp, {}); WARN = await get(K.warn, []); CHG = await get(K.chg, []); SUM = await get(K.sum, {});
   META = await get(K.meta, META); PEND = await get(K.pend, PEND);
-  CONN = SHEETS_URL ? { url:SHEETS_URL, token:SHEETS_TOKEN }
-    : load(K.conn, null) || { url:CFG.data.gasUrl || load('att_settings_v1', {})?.gasUrl || '', token:'' };
+  CONN = load(K.conn, null) || { url:CFG.data.gasUrl || load('att_settings_v1', {})?.gasUrl || '', token:'' };
+  if (SHEETS_URL) CONN.url = SHEETS_URL;
+  if (SHEETS_TOKEN) CONN.token = SHEETS_TOKEN;
   if (IDB.db && localStorage.getItem(K.rec)) { // ย้ายจาก localStorage ไป IndexedDB แล้วลบของเก่า
     await Promise.all([IDB.set(K.rec, DB), IDB.set(K.cfg, CFG), IDB.set(K.emp, EMP), IDB.set(K.warn, WARN)]);
     [K.rec, K.cfg, K.emp, K.warn].forEach(k => localStorage.removeItem(k));
   }
   applyLook(); render(); setSync('');
-  if (CONN.url) {
+  if (CONN.url && !CONN.token) openTokenPrompt(); // เครื่องใหม่: ถามรหัสลับครั้งเดียว
+  else if (CONN.url) {
     // ครั้งแรกที่เครื่องนี้ต่อกับชีต: ถ้าชีตยังว่างแต่ในเครื่องมีข้อมูล ส่งขึ้นไปให้เลย
     if (!Object.keys(META.months).length && Object.keys(DB).length) {
       try { const m = await api('meta'); if (!Object.keys(m.months).length) markAllPending(); } catch {}
@@ -1115,23 +1118,54 @@ function viewSettings() {
   </div>
   </div>
 
-  <div class="card sec"><h3>Google Sheets (เก็บข้อมูลถาวร + ใช้ร่วมกันหลายเครื่อง)</h3>
-    ${SHEETS_URL ? `<p class="hint" style="margin:0 0 6px">เชื่อมต่ออัตโนมัติจากค่าที่ใส่ไว้ในไฟล์ (SHEETS_URL / SHEETS_TOKEN) · บันทึกขึ้นชีตทันทีที่มีการเปลี่ยนแปลง และดึงข้อมูลใหม่ตอนเปิดหน้า ตอนกลับมาที่หน้านี้ และทุก 5 นาที</p>` : `
-    <div class="form">
-      <label>Apps Script Web App URL<input type="text" data-conn="url" value="${esc(CONN.url)}" placeholder="https://script.google.com/macros/s/.../exec"></label>
-      <label>รหัสลับ (ต้องตรงกับ TOKEN ใน Apps Script)<input type="text" data-conn="token" value="${esc(CONN.token)}" placeholder="รหัสลับที่ตั้งไว้" autocomplete="off" style="-webkit-text-security:disc"></label>
-    </div>`}
-    <div class="actions" style="justify-content:flex-start">
-      <button class="btn primary" data-act="connTest">ทดสอบการเชื่อมต่อ</button>
-      <button class="btn" data-act="syncNow" ${CONN.url ? '' : 'disabled'}>ซิงค์ตอนนี้</button>
-      <button class="btn" data-act="pushAll" ${CONN.url ? '' : 'disabled'} title="ส่งข้อมูลทั้งหมดในเครื่องนี้ขึ้น Sheets (ใช้ครั้งแรก)">ส่งข้อมูลทั้งหมดขึ้น Sheets</button>
-      <button class="btn" data-act="pullAll" ${CONN.url ? '' : 'disabled'} title="ดาวน์โหลดทุกเดือนจาก Sheets มาใหม่">โหลดทั้งหมดจาก Sheets ใหม่</button>
-    </div>
+  ${viewSheetsCard()}`;
+}
+function viewSheetsCard() {
+  const on = !!(CONN.url && CONN.token);
+  const fields = `<div class="form">
+      ${SHEETS_URL ? '' : `<label>Apps Script Web App URL<input type="text" data-conn="url" value="${esc(CONN.url)}" placeholder="https://script.google.com/macros/s/.../exec"></label>`}
+      <label>รหัสลับ<input type="text" data-conn="token" value="${esc(CONN.token)}" placeholder="รหัสลับจากผู้ดูแล" autocomplete="off" style="-webkit-text-security:disc"></label>
+    </div>`;
+  const tools = `<div class="actions" style="justify-content:flex-start">
+      <button class="btn" data-act="syncNow">ซิงค์ตอนนี้</button>
+      <button class="btn" data-act="pushAll" title="ส่งข้อมูลทั้งหมดในเครื่องนี้ขึ้น Sheets">ส่งข้อมูลทั้งหมดขึ้น Sheets</button>
+      <button class="btn" data-act="pullAll" title="ดาวน์โหลดทุกเดือนจาก Sheets มาใหม่">โหลดทั้งหมดจาก Sheets ใหม่</button>
+      <button class="btn danger" data-act="disconnect">เลิกเชื่อมต่อเครื่องนี้</button>
+    </div>`;
+  if (on) return `<div class="card sec"><h3>Google Sheets <span class="pill st p-ok">เชื่อมต่อแล้ว</span></h3>
     <p class="sync ${SYNC.state}" id="syncInfo">${syncText()}</p>
-    <p class="hint">วิธีเชื่อมต่อดูในไฟล์ <b>sheets-script/Code.gs</b> · รหัสลับอยู่ในไฟล์ sheets-script/token.gs ในเครื่องของผู้ดูแล<br>
-    ข้อมูลสแกนเก็บแยกชีตรายเดือน (rec_2026-10 …) โปรแกรมโหลดเฉพาะเดือนที่มีการเปลี่ยนแปลง และเก็บสำเนาไว้ในเครื่อง จึงเปิดเร็วแม้ข้อมูลจะเยอะ<br>
-    ${SHEETS_URL ? '' : 'URL และรหัสลับเก็บเฉพาะในเครื่องนี้ ไม่ถูกส่งไปที่อื่น (หรือใส่ไว้ในไฟล์ที่ SHEETS_URL / SHEETS_TOKEN เพื่อให้ต่ออัตโนมัติทุกเครื่อง) · '}การตั้งค่า (ยกเว้นหน้าตา) กะพนักงาน ใบเตือน และประวัติแก้ย้อนหลังซิงค์ให้ทุกเครื่อง</p>
+    <p class="hint">บันทึกขึ้นชีตอัตโนมัติทุกครั้งที่มีการเปลี่ยนแปลง และดึงข้อมูลใหม่อัตโนมัติตอนเปิดหน้า ตอนกลับมาที่หน้านี้ และทุก 5 นาที ไม่ต้องกดอะไร</p>
+    <details style="margin-top:10px"><summary class="muted small" style="cursor:pointer">ตั้งค่าขั้นสูง</summary>${fields}${tools}</details>
   </div>`;
+  return `<div class="card sec"><h3>Google Sheets <span class="pill st p-warn">ยังไม่ได้เชื่อมต่อ</span></h3>
+    ${fields}
+    <div class="actions" style="justify-content:flex-start"><button class="btn primary" data-act="connTest">เชื่อมต่อ</button></div>
+    <p class="sync ${SYNC.state}" id="syncInfo">${syncText()}</p>
+    <p class="hint">ใส่ครั้งเดียวต่อเครื่อง/เบราว์เซอร์ หลังจากนั้นระบบบันทึกและดึงข้อมูลให้อัตโนมัติ · รหัสลับอยู่ในไฟล์ sheets-script/token.gs ในเครื่องของผู้ดูแล</p>
+  </div>`;
+}
+function openTokenPrompt() {
+  showModal(`
+  <div class="mhead"><div><h2>เชื่อมต่อ Google Sheets</h2><p class="muted">ใส่รหัสลับครั้งแรกครั้งเดียว เครื่องนี้จะจำไว้ แล้วบันทึกและดึงข้อมูลให้อัตโนมัติ</p></div><button class="btn icon" data-act="close">✕</button></div>
+  <div class="form"><label>รหัสลับ<input type="text" id="tokIn" placeholder="รหัสลับจากผู้ดูแล" autocomplete="off" style="-webkit-text-security:disc"></label>
+  <p class="small" id="tokErr" style="color:var(--danger)"></p></div>
+  <div class="actions"><button class="btn" data-act="close">ไว้ทีหลัง</button><button class="btn primary" data-act="tokenSave">เชื่อมต่อ</button></div>`, true);
+  setTimeout(() => $('#tokIn')?.focus(), 50);
+}
+async function connect(token, errEl) {
+  const prev = CONN.token; CONN.token = token.trim();
+  setSync('busy', 'ทดสอบ…');
+  try {
+    const m = await api('meta');
+    saveConn();
+    if (!Object.keys(m.months).length && Object.keys(DB).length) markAllPending(); // ชีตว่าง → ส่งข้อมูลในเครื่องขึ้นไป
+    await sync(true);
+    return true;
+  } catch (e) {
+    CONN.token = prev; setSync('err', e.message);
+    if (errEl) errEl.textContent = 'เชื่อมต่อไม่ได้: ' + e.message;
+    return false;
+  }
 }
 
 /* ================= ตัวแก้สถานะที่สร้างเอง ================= */
@@ -1272,6 +1306,7 @@ const STORE = {
 };
 function syncText() {
   if (!CONN.url) return 'ยังไม่ได้เชื่อมต่อ';
+  if (!CONN.token) return 'ยังไม่ได้ใส่รหัสลับ';
   if (SYNC.state === 'busy') return 'กำลังซิงค์… ' + (SYNC.msg || '');
   if (SYNC.state === 'err') return 'ซิงค์ไม่สำเร็จ: ' + SYNC.msg;
   const n = Object.keys(PEND.rows).length + Object.keys(PEND.store).length;
@@ -1296,7 +1331,7 @@ function markStore(k) { PEND.store[k] = 1; persist(K.pend, PEND); if (!CONN.url)
 
 /* ส่งของที่ค้างก่อน แล้วค่อยดึงเดือนที่มีคนอื่นแก้ */
 function sync(quiet) {
-  if (!CONN.url) return Promise.resolve();
+  if (!CONN.url || !CONN.token) return Promise.resolve();
   if (syncing) return syncing;
   syncing = (async () => {
     setSync('busy');
@@ -1497,17 +1532,25 @@ document.addEventListener('click', e => {
     case 'chgClear': if (confirm('ล้างประวัติแก้ย้อนหลัง และเอาเครื่องหมายสีส้มในปฏิทินออก?')) {
       CHG = []; saveChg(); Object.entries(DB).forEach(([k, r]) => { if (r.prev != null) { delete r.prev; PEND.rows[k] = 1; } });
       CACHE.clear(); saveDB(); saveSync(); closeModal(); render(); if (CONN.url) sync(); } break;
-    case 'syncNow': if (!CONN.url) { state.tab = 'settings'; render(); break; } sync().then(() => SYNC.state === 'ok' && toast('ซิงค์แล้ว')); break;
-    case 'connTest': {
+    case 'syncNow':
+      if (!CONN.url) { state.tab = 'settings'; render(); break; }
+      if (!CONN.token) { openTokenPrompt(); break; }
+      sync().then(() => SYNC.state === 'ok' && toast('ซิงค์แล้ว')); break;
+    case 'connTest':
       if (!CONN.url) { toast('ใส่ URL ก่อน'); break; }
-      setSync('busy', 'ทดสอบ…');
-      api('meta').then(m => {
-        const first = !Object.keys(META.months).length && !Object.keys(m.months).length;
-        if (first && Object.keys(DB).length && confirm(`เชื่อมต่อสำเร็จ Sheets ยังว่างอยู่ ส่งข้อมูลในเครื่องนี้ (${Object.keys(DB).length} รายการ) และการตั้งค่าขึ้นไปเลยไหม?`)) markAllPending();
-        sync().then(() => toast(`เชื่อมต่อสำเร็จ · ใน Sheets มี ${Object.keys(m.months).length} เดือน`));
-      }).catch(e => { setSync('err', e.message); toast('เชื่อมต่อไม่ได้: ' + e.message); });
+      if (!CONN.token) { toast('ใส่รหัสลับก่อน'); break; }
+      connect(CONN.token).then(ok => { toast(ok ? 'เชื่อมต่อแล้ว ระบบจะบันทึกและดึงข้อมูลอัตโนมัติ' : 'เชื่อมต่อไม่ได้: ' + SYNC.msg); render(); });
+      break;
+    case 'tokenSave': {
+      const v = $('#tokIn').value.trim();
+      if (!v) { $('#tokErr').textContent = 'ใส่รหัสลับก่อน'; break; }
+      t.disabled = true; $('#tokErr').textContent = 'กำลังเชื่อมต่อ…';
+      connect(v, $('#tokErr')).then(ok => { t.disabled = false; if (ok) { closeModal(); render(); toast('เชื่อมต่อแล้ว ระบบจะบันทึกและดึงข้อมูลอัตโนมัติ'); } });
       break;
     }
+    case 'disconnect':
+      if (confirm('เลิกเชื่อมต่อ Google Sheets ในเครื่องนี้? (ข้อมูลในชีตไม่ถูกลบ ต้องใส่รหัสลับใหม่ถ้าจะใช้อีก)')) { CONN.token = ''; saveConn(); setSync(''); render(); }
+      break;
     case 'pushAll': if (confirm(`ส่งข้อมูลทั้งหมดในเครื่องนี้ (${Object.keys(DB).length} รายการ) การตั้งค่า กะ และใบเตือน ขึ้น Sheets? (ทับข้อมูลวันเดียวกันใน Sheets)`)) { markAllPending(); sync(); } break;
     case 'pullAll': if (confirm('โหลดข้อมูลทุกเดือนจาก Sheets มาใหม่?')) { META = { months:{}, store:{} }; saveSync(); sync(); } break;
   }
@@ -1589,7 +1632,10 @@ document.addEventListener('input', e => {
   if (ds.o && oDraft) { oDraft[ds.o] = t.value; return; }
 });
 document.addEventListener('change', e => { const ds = e.target.dataset; if (ds.w && wDraft) wDraft[ds.w] = e.target.value; if (ds.o && oDraft) oDraft[ds.o] = e.target.value; });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Enter' && e.target.id === 'tokIn') $('[data-act="tokenSave"]')?.click();
+});
 ['dragover','drop'].forEach(ev => document.addEventListener(ev, e => {
   e.preventDefault();
   if (ev === 'drop' && e.dataTransfer.files.length) handleFiles([...e.dataTransfer.files]);
