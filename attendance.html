@@ -224,12 +224,16 @@ async function boot() {
   CONN = load(K.conn, null) || { url:CFG.data.gasUrl || load('att_settings_v1', {})?.gasUrl || '', token:'' };
   if (SHEETS_URL) CONN.url = SHEETS_URL;
   if (SHEETS_TOKEN) CONN.token = SHEETS_TOKEN;
+  // ลิงก์พิเศษ ...#k=รหัสลับ → จำรหัสไว้ในเครื่องนี้ แล้วลบออกจากแถบที่อยู่ทันที (ส่วนหลัง # ไม่ถูกส่งไปที่เซิร์ฟเวอร์)
+  const hk = new URLSearchParams(location.hash.slice(1)).get('k');
+  if (hk) { CONN.token = hk; saveConn(); history.replaceState(null, '', location.pathname + location.search); }
   if (IDB.db && localStorage.getItem(K.rec)) { // ย้ายจาก localStorage ไป IndexedDB แล้วลบของเก่า
     await Promise.all([IDB.set(K.rec, DB), IDB.set(K.cfg, CFG), IDB.set(K.emp, EMP), IDB.set(K.warn, WARN)]);
     [K.rec, K.cfg, K.emp, K.warn].forEach(k => localStorage.removeItem(k));
   }
   applyLook(); render(); setSync('');
   if (CONN.url && !CONN.token) openTokenPrompt(); // เครื่องใหม่: ถามรหัสลับครั้งเดียว
+  else if (hk) sync(true).then(() => toast(SYNC.state === 'ok' ? 'เชื่อมต่อเครื่องนี้แล้ว จากนี้ไม่ต้องใส่รหัสอีก' : 'ลิงก์ไม่ถูกต้อง: ' + SYNC.msg));
   else if (CONN.url) {
     // ครั้งแรกที่เครื่องนี้ต่อกับชีต: ถ้าชีตยังว่างแต่ในเครื่องมีข้อมูล ส่งขึ้นไปให้เลย
     if (!Object.keys(META.months).length && Object.keys(DB).length) {
@@ -1135,6 +1139,8 @@ function viewSheetsCard() {
   if (on) return `<div class="card sec"><h3>Google Sheets <span class="pill st p-ok">เชื่อมต่อแล้ว</span></h3>
     <p class="sync ${SYNC.state}" id="syncInfo">${syncText()}</p>
     <p class="hint">บันทึกขึ้นชีตอัตโนมัติทุกครั้งที่มีการเปลี่ยนแปลง และดึงข้อมูลใหม่อัตโนมัติตอนเปิดหน้า ตอนกลับมาที่หน้านี้ และทุก 5 นาที ไม่ต้องกดอะไร</p>
+    <div class="actions" style="justify-content:flex-start"><button class="btn" data-act="copyLink">คัดลอกลิงก์สำหรับเครื่องอื่น</button></div>
+    <p class="hint" style="margin-top:0">ส่งลิงก์นี้ให้ตัวเอง (เช่น LINE Keep / อีเมล) แล้วเปิดบนเครื่องอื่น เครื่องนั้นจะเชื่อมต่อเองโดยไม่ต้องพิมพ์รหัส · ลิงก์มีรหัสลับอยู่ ห้ามส่งให้คนอื่นหรือโพสต์ในที่สาธารณะ</p>
     <details style="margin-top:10px"><summary class="muted small" style="cursor:pointer">ตั้งค่าขั้นสูง</summary>${fields}${tools}</details>
   </div>`;
   return `<div class="card sec"><h3>Google Sheets <span class="pill st p-warn">ยังไม่ได้เชื่อมต่อ</span></h3>
@@ -1546,6 +1552,12 @@ document.addEventListener('click', e => {
       if (!v) { $('#tokErr').textContent = 'ใส่รหัสลับก่อน'; break; }
       t.disabled = true; $('#tokErr').textContent = 'กำลังเชื่อมต่อ…';
       connect(v, $('#tokErr')).then(ok => { t.disabled = false; if (ok) { closeModal(); render(); toast('เชื่อมต่อแล้ว ระบบจะบันทึกและดึงข้อมูลอัตโนมัติ'); } });
+      break;
+    }
+    case 'copyLink': {
+      const link = location.origin + location.pathname + '#k=' + encodeURIComponent(CONN.token);
+      (navigator.clipboard?.writeText(link) || Promise.reject()).then(() => toast('คัดลอกลิงก์แล้ว ส่งให้ตัวเองแล้วเปิดบนเครื่องอื่น'))
+        .catch(() => prompt('คัดลอกลิงก์นี้ไปเปิดบนเครื่องอื่น', link));
       break;
     }
     case 'disconnect':
