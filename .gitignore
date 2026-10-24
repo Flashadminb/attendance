@@ -1,0 +1,12 @@
+# รหัสลับของ API และข้อมูลการเชื่อม clasp — ห้ามขึ้น GitHub
+sheets-script/token.gs
+sheets-script/.clasp.json
+.clasprc.json
+
+# ไฟล์ข้อมูลพนักงาน ห้ามขึ้น GitHub
+*.xlsx
+*.xls
+*.json.bak
+attendance_backup_*.json
+
+.claude/
