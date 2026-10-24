@@ -234,13 +234,7 @@ async function boot() {
   applyLook(); render(); setSync('');
   if (CONN.url && !CONN.token) openTokenPrompt(); // เครื่องใหม่: ถามรหัสลับครั้งเดียว
   else if (hk) sync(true).then(() => toast(SYNC.state === 'ok' ? 'เชื่อมต่อเครื่องนี้แล้ว จากนี้ไม่ต้องใส่รหัสอีก' : 'ลิงก์ไม่ถูกต้อง: ' + SYNC.msg));
-  else if (CONN.url) {
-    // ครั้งแรกที่เครื่องนี้ต่อกับชีต: ถ้าชีตยังว่างแต่ในเครื่องมีข้อมูล ส่งขึ้นไปให้เลย
-    if (!Object.keys(META.months).length && Object.keys(DB).length) {
-      try { const m = await api('meta'); if (!Object.keys(m.months).length) markAllPending(); } catch {}
-    }
-    sync(true);
-  }
+  else if (CONN.url) sync(true);
   // ดึงข้อมูลใหม่จากชีตทุก 5 นาที และทุกครั้งที่กลับมาที่หน้านี้
   setInterval(() => { if (CONN.url && !document.hidden) sync(true); }, 5 * 60 * 1000);
   document.addEventListener('visibilitychange', () => { if (CONN.url && !document.hidden) sync(true); });
@@ -354,7 +348,17 @@ async function handleFiles(files) {
     }
     if (!all.length) { toast('ไม่พบข้อมูล (หาคอลัมน์ "รหัสพนักงาน" หรือคอลัมน์วันที่ไม่เจอ)'); return; }
     // ดึงข้อมูลล่าสุดจาก Google Sheets ก่อน เพื่อเทียบการเปลี่ยนแปลงกับข้อมูลที่ถูกต้องที่สุด
-    if (CONN.url) { toast('กำลังตรวจข้อมูลล่าสุดจาก Google Sheets…'); await sync(true); }
+    // (ข้ามถ้าเดือนในไฟล์อยู่ในเครื่องครบ และเพิ่งซิงค์ไปไม่ถึง 1 นาที)
+    if (connected()) {
+      const fm = [...new Set(all.map(r => r.date.slice(0,7)))];
+      const missing = fm.filter(m => META.avail?.[m] && !isLoaded(m));
+      if (missing.length || Date.now() - SYNC.at > 60000) {
+        toast('กำลังตรวจข้อมูลล่าสุดจาก Google Sheets…');
+        missing.forEach(m => { WANT.add(m); ASKED[m] = META.avail[m]; });
+        if (syncing) await syncing;
+        await sync(true);
+      }
+    }
     const at = Date.now(), changed = [];
     let added = 0, same = 0;
     for (const r of all) {
@@ -690,16 +694,20 @@ const TABS = [['day','ภาพรวมวัน'],['cal','ปฏิทิน']
 function fillSelect(sel, opts, val) { $(sel).innerHTML = opts.map(([v,t]) => opt(v, t, val)).join(''); }
 
 function render() {
-  const all = Object.values(DB), has = all.length > 0;
+  const all = Object.values(DB), has = all.length > 0 || availMonths().length > 0;
   ['#branch','#month','#shiftSel'].forEach(s => $(s).hidden = !has);
+  let loading = false;
   if (has) {
     const branches = [...new Set(all.map(r => r.branch))].sort();
-    const months = [...new Set(all.map(r => r.date.slice(0,7)))].sort();
+    // เดือนที่มีในเครื่อง + เดือนที่มีในชีต (ยังไม่ได้โหลด)
+    const months = [...new Set([...all.map(r => r.date.slice(0,7)), ...availMonths()])].sort();
     if (!months.includes(state.month)) state.month = months.at(-1);
+    requestMonths(neededMonths());
+    loading = connected() && !!META.avail?.[state.month] && !isLoaded(state.month);
     if (state.shift !== 'all' && state.shift !== '_none' && !shiftById(state.shift)) state.shift = 'all';
     fillSelect('#branch', [['all','ทุกสาขา'], ...branches.map(b => [b,b])], state.branch);
     fillSelect('#shiftSel', [['all','ทุกกะ'], ...CFG.shifts.map(s => [s.id, 'กะ ' + s.name]), ['_none','ไม่ทราบกะ']], state.shift);
-    fillSelect('#month', months.map(m => [m, thMonth(m)]), state.month);
+    fillSelect('#month', months.map(m => [m, thMonth(m) + (connected() && META.avail?.[m] && !isLoaded(m) ? ' ☁' : '')]), state.month);
     W = warnEval();
   } else W = [];
   const pc = pending().length;
@@ -708,9 +716,10 @@ function render() {
   if (state.tab === 'settings') { v.innerHTML = viewSettings(); return; }
   if (state.tab === 'emp') { v.innerHTML = viewEmp(); applySearch(); return; }
   if (!has) { v.innerHTML = emptyCard(); return; }
-  if (state.tab === 'warn') { v.innerHTML = viewWarn(); return; }
+  const loadingCard = `<div class="card muted">กำลังโหลด ${state.month ? thMonth(state.month) : ''} จาก Google Sheets…</div>`;
+  if (state.tab === 'warn') { v.innerHTML = (loading ? loadingCard : '') + viewWarn(); return; }
   const recs = filtered();
-  if (!recs.length) { v.innerHTML = '<div class="card muted">ไม่มีข้อมูลในตัวกรองนี้</div>'; return; }
+  if (!recs.length) { v.innerHTML = loading ? loadingCard : '<div class="card muted">ไม่มีข้อมูลในตัวกรองนี้</div>'; return; }
   const days = [...new Set(recs.map(r => r.date))].sort();
   if (!days.includes(state.date)) state.date = days.at(-1);
   v.innerHTML = state.tab === 'day' ? viewDay(recs, days) : state.tab === 'cal' ? viewCal(recs, days) : state.tab === 'stats' ? viewStats(recs) : viewPeople(recs);
@@ -1335,64 +1344,96 @@ async function api(action, payload = {}) {
 }
 function markStore(k) { PEND.store[k] = 1; persist(K.pend, PEND); if (!CONN.url) return; clearTimeout(pushTimer); pushTimer = setTimeout(() => sync(), 1500); }
 
-/* ส่งของที่ค้างก่อน แล้วค่อยดึงเดือนที่มีคนอื่นแก้ */
+/* ซิงค์ในคำขอเดียว: ส่งของที่ค้าง + รับเฉพาะเดือน/ข้อมูลที่เครื่องนี้ยังไม่มี */
+const WANT = new Set();   // เดือนที่ต้องโหลดจากชีต
+const ASKED = {};         // เดือน → เวอร์ชันที่ขอไปแล้ว (กันขอซ้ำ)
+let syncAgain = false, bgTimer = null;
+const RECENT_MONTHS = 2;  // เครื่องใหม่: โหลด 2 เดือนล่าสุดก่อน ที่เหลือโหลดเบื้องหลัง
+const BG_CHUNK = 4;       // โหลดเดือนเก่าเบื้องหลังครั้งละกี่เดือน
+const ROW_CHUNK = 5000;   // ส่งข้อมูลสแกนครั้งละกี่แถว
+const connected = () => !!(CONN.url && CONN.token);
+const isLoaded = m => META.months[m] != null;
+const availMonths = () => Object.keys(META.avail || {});
+
 function sync(quiet) {
-  if (!CONN.url || !CONN.token) return Promise.resolve();
-  if (syncing) return syncing;
+  if (!connected()) return Promise.resolve();
+  if (syncing) { syncAgain = true; return syncing; }
   syncing = (async () => {
     setSync('busy');
+    let want = [];
     try {
-      // 1) ส่งข้อมูลสแกนที่ค้าง
-      const keys = Object.keys(PEND.rows).filter(k => DB[k]);
-      for (let i = 0; i < keys.length; i += 3000) {
-        const part = keys.slice(i, i + 3000);
-        setSync('busy', `ส่ง ${Math.min(i + 3000, keys.length)}/${keys.length}`);
-        const sk = i === 0 ? Object.keys(PEND.sums).filter(k => SUM[k]) : [];
-        // ไม่อัปเดต META ของเดือนที่ส่ง เพื่อให้รอบดึงข้อมูลโหลดเดือนนั้นซ้ำ เผื่อเครื่องอื่นแก้พร้อมกัน
-        await api('upsert', { rows:part.map(k => recToRow(k, DB[k])), sums:sk.map(k => sumToRow(k, SUM[k])) });
-        part.forEach(k => delete PEND.rows[k]); sk.forEach(k => delete PEND.sums[k]);
-        saveSync();
-      }
-      PEND.rows = {}; if (!keys.length && Object.keys(PEND.sums).length) {
-        const sk = Object.keys(PEND.sums).filter(k => SUM[k]);
-        if (sk.length) await api('upsert', { rows:[], sums:sk.map(k => sumToRow(k, SUM[k])) });
-        PEND.sums = {};
-      }
-      // 2) ส่งการตั้งค่า / กะ / ใบเตือน ที่ค้าง
-      for (const k of Object.keys(PEND.store)) {
-        const r = await api('setStore', { key:k, value:JSON.stringify(STORE[k].get()) });
-        META.store[k] = r.u; delete PEND.store[k];
-      }
-      saveSync();
-      // 3) ดึงเฉพาะเดือน/ข้อมูลที่ใหม่กว่าในเครื่อง
-      const m = await api('meta');
-      const need = Object.entries(m.months).filter(([mo, x]) => (META.months[mo] || 0) < x.u).map(([mo]) => mo).sort();
-      let changedAny = false;
-      for (let i = 0; i < need.length; i += 3) {
-        const ms = need.slice(i, i + 3);
-        setSync('busy', `โหลด ${ms.join(', ')}`);
-        const r = await api('getMonths', { months:ms });
-        Object.values(r.rows).flat().forEach(a => { const [k, rec] = rowToRec(a); if (!PEND.rows[k]) DB[k] = rec; });
-        (r.sums || []).forEach(a => { const [k, s] = rowToSum(a); if (!PEND.sums[k]) SUM[k] = s; });
-        ms.forEach(mo => META.months[mo] = m.months[mo].u);
-        changedAny = true;
-      }
-      const sk = Object.keys(m.store).filter(k => STORE[k] && (META.store[k] || 0) < m.store[k] && !PEND.store[k]);
-      if (sk.length) {
-        const r = await api('getStore', { keys:sk });
-        Object.entries(r.values).forEach(([k, v]) => { try { STORE[k].set(JSON.parse(v)); } catch {} META.store[k] = m.store[k]; });
-        changedAny = true;
-      }
-      if (changedAny) { CACHE.clear(); saveDB(); persist(K.sum, SUM); applyLook(); }
+      const keys = Object.keys(PEND.rows).filter(k => DB[k]).slice(0, ROW_CHUNK);
+      const snap = keys.map(k => DB[k].raw + '|' + (DB[k].prev ?? ''));
+      const sk = Object.keys(PEND.sums).filter(k => SUM[k]);
+      const stores = {}; Object.keys(PEND.store).forEach(k => { if (STORE[k]) stores[k] = JSON.stringify(STORE[k].get()); });
+      want = [...WANT]; WANT.clear();
+      const fresh = !Object.keys(META.months).length;
+      if (keys.length) setSync('busy', `ส่ง ${keys.length} รายการ`); else if (want.length || fresh) setSync('busy', 'โหลดข้อมูล');
+      const r = await api('sync', {
+        rows: keys.map(k => recToRow(k, DB[k])), sums: sk.map(k => sumToRow(k, SUM[k])), stores,
+        have: { months: META.months, store: META.store }, want, recent: fresh ? RECENT_MONTHS : 0,
+      });
+      // ล้างรายการที่ส่งสำเร็จ (ถ้าระหว่างรอมีการแก้ซ้ำ จะคงไว้ส่งรอบหน้า)
+      keys.forEach((k, i) => { if (DB[k] && DB[k].raw + '|' + (DB[k].prev ?? '') === snap[i]) delete PEND.rows[k]; });
+      sk.forEach(k => delete PEND.sums[k]);
+      Object.keys(stores).forEach(k => { if (JSON.stringify(STORE[k].get()) === stores[k]) delete PEND.store[k]; });
+
+      let changed = false;
+      Object.entries(r.wrote || {}).forEach(([m, x]) => { if (!r.rows[m]) META.months[m] = x.u; });
+      Object.entries(r.rows || {}).forEach(([m, arr]) => {
+        arr.forEach(a => { const [k, rec] = rowToRec(a); if (!PEND.rows[k]) DB[k] = rec; });
+        META.months[m] = r.months[m]; changed = true;
+      });
+      (r.sums || []).forEach(a => { const [k, s] = rowToSum(a); if (!PEND.sums[k]) SUM[k] = s; });
+      Object.entries(r.storeU || {}).forEach(([k, u]) => META.store[k] = u);
+      Object.entries(r.storeVals || {}).forEach(([k, v]) => { if (PEND.store[k]) return; try { STORE[k].set(JSON.parse(v)); changed = true; } catch {} META.store[k] = r.store[k]; });
+      META.avail = r.months || {};
+      // ชีตยังว่างแต่ในเครื่องมีข้อมูล → ส่งทั้งหมดขึ้นไป
+      if (fresh && !Object.keys(META.avail).length && !keys.length && Object.keys(DB).length) markAllPending();
+      if (changed) { CACHE.clear(); saveDB(); persist(K.sum, SUM); applyLook(); }
       saveSync();
       setSync('ok');
-      if (changedAny) render();
+      if (changed || want.length || fresh) render();
+      if (Object.keys(PEND.rows).length || Object.keys(PEND.store).length) syncAgain = true;
+      scheduleBackground();
     } catch (e) {
       setSync('err', e.message);
       if (!quiet) toast('ซิงค์ไม่สำเร็จ: ' + e.message);
-    } finally { syncing = null; }
+      want.forEach(m => delete ASKED[m]); // ให้ขอใหม่ได้รอบหน้า
+      syncAgain = false;
+    } finally {
+      syncing = null;
+      if (syncAgain) { syncAgain = false; setTimeout(() => sync(true), 0); }
+    }
   })();
   return syncing;
+}
+
+/* ขอโหลดเดือนที่ยังไม่มีในเครื่อง (ไม่ขอซ้ำถ้าขอเวอร์ชันนั้นไปแล้ว) */
+function requestMonths(ms) {
+  const need = ms.filter(m => META.avail?.[m] && !isLoaded(m) && ASKED[m] !== META.avail[m]);
+  if (!need.length || !connected()) return false;
+  need.forEach(m => { WANT.add(m); ASKED[m] = META.avail[m]; });
+  setTimeout(() => sync(true), 0);
+  return true;
+}
+/* โหลดเดือนเก่าทีละนิดเบื้องหลัง เดือนใหม่ก่อน */
+function scheduleBackground() {
+  clearTimeout(bgTimer);
+  const missing = availMonths().filter(m => !isLoaded(m) && ASKED[m] !== META.avail[m]).sort().reverse();
+  if (!missing.length) return;
+  bgTimer = setTimeout(() => { if (!syncing) requestMonths(missing.slice(0, BG_CHUNK)); else scheduleBackground(); }, 800);
+}
+/* เดือนที่หน้าปัจจุบันต้องใช้ */
+function neededMonths() {
+  if (!state.month) return [];
+  const [y, m] = state.month.split('-').map(Number);
+  const out = new Set([state.month, m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2,'0')}`]);
+  CFG.rules.forEach(r => {
+    if (r.period === 'year') for (let i = 1; i <= 12; i++) out.add(`${y}-${String(i).padStart(2,'0')}`);
+    if (r.period === 'days') { const d = new Date(state.month + '-28T00:00'); const n = Math.ceil((+r.days || 30) / 28) + 1; for (let i = 0; i <= n; i++) { const t = new Date(d); t.setMonth(d.getMonth() - i); out.add(iso(t).slice(0,7)); } }
+  });
+  return [...out];
 }
 
 /* ================= ประวัติแก้ย้อนหลัง ================= */
@@ -1533,7 +1574,7 @@ document.addEventListener('click', e => {
     case 'accentReset': CFG.look.accent = ''; cfgChanged(true); break;
     case 'backup': download(`attendance_backup_${today()}.json`, JSON.stringify({ app:'attendance', v:3, at:new Date().toISOString(), DB, CFG, EMP, WARN, CHG, SUM })); break;
     case 'resetCfg': if (confirm('คืนค่าตั้งค่าทั้งหมด (กะ สถานะ เงื่อนไข หน้าตา) เป็นค่าเริ่มต้น? ข้อมูลสแกน การตั้งกะพนักงาน และใบเตือนจะไม่ถูกลบ')) { CFG = clone(DEFAULTS); cfgChanged(); } break;
-    case 'clear': if (confirm('ลบข้อมูลสแกนในเครื่องนี้? (ถ้าเชื่อม Google Sheets ไว้ จะโหลดกลับมาใหม่ตอนซิงค์ ข้อมูลใน Sheets ไม่ถูกลบ)')) { DB = {}; PEND.rows = {}; META.months = {}; CACHE.clear(); saveDB(); saveSync(); render(); } break;
+    case 'clear': if (confirm('ลบข้อมูลสแกนในเครื่องนี้? (ถ้าเชื่อม Google Sheets ไว้ จะโหลดกลับมาใหม่ตอนซิงค์ ข้อมูลใน Sheets ไม่ถูกลบ)')) { DB = {}; PEND.rows = {}; META.months = {}; Object.keys(ASKED).forEach(k => delete ASKED[k]); CACHE.clear(); saveDB(); saveSync(); render(); } break;
     case 'changes': openChanges(); break;
     case 'chgClear': if (confirm('ล้างประวัติแก้ย้อนหลัง และเอาเครื่องหมายสีส้มในปฏิทินออก?')) {
       CHG = []; saveChg(); Object.entries(DB).forEach(([k, r]) => { if (r.prev != null) { delete r.prev; PEND.rows[k] = 1; } });
@@ -1564,7 +1605,7 @@ document.addEventListener('click', e => {
       if (confirm('เลิกเชื่อมต่อ Google Sheets ในเครื่องนี้? (ข้อมูลในชีตไม่ถูกลบ ต้องใส่รหัสลับใหม่ถ้าจะใช้อีก)')) { CONN.token = ''; saveConn(); setSync(''); render(); }
       break;
     case 'pushAll': if (confirm(`ส่งข้อมูลทั้งหมดในเครื่องนี้ (${Object.keys(DB).length} รายการ) การตั้งค่า กะ และใบเตือน ขึ้น Sheets? (ทับข้อมูลวันเดียวกันใน Sheets)`)) { markAllPending(); sync(); } break;
-    case 'pullAll': if (confirm('โหลดข้อมูลทุกเดือนจาก Sheets มาใหม่?')) { META = { months:{}, store:{} }; saveSync(); sync(); } break;
+    case 'pullAll': if (confirm('โหลดข้อมูลทุกเดือนจาก Sheets มาใหม่?')) { META = { months:{}, store:{}, avail:META.avail }; Object.keys(ASKED).forEach(k => delete ASKED[k]); saveSync(); sync(); } break;
   }
 });
 

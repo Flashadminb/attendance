@@ -44,7 +44,7 @@ function doPost(e) {
     const req = JSON.parse(e.postData.contents);
     if (typeof TOKEN === 'undefined' || !TOKEN) return out({ ok: false, error: 'ยังไม่ได้ตั้ง TOKEN ใน token.gs' });
     if (req.token !== TOKEN) return out({ ok: false, error: 'รหัสลับไม่ถูกต้อง' });
-    const fns = { meta: meta, getMonths: getMonths, upsert: upsert, getStore: getStore, setStore: setStore };
+    const fns = { sync: syncAll, meta: meta, getMonths: getMonths, upsert: upsert, getStore: getStore, setStore: setStore };
     const fn = fns[req.action];
     if (!fn) return out({ ok: false, error: 'ไม่รู้จักคำสั่ง ' + req.action });
     const res = fn(req);
@@ -163,17 +163,83 @@ function getStore(req) {
   return { values: values };
 }
 
-function setStore(req) {
+function writeStore(key, value) {
   const sh = sheet('_store', ['key']);
-  const value = String(req.value || '');
+  value = String(value || '');
   const parts = [];
   for (let i = 0; i < value.length; i += CHUNK) parts.push('~' + value.slice(i, i + CHUNK)); // ~ กันไม่ให้ขึ้นต้นด้วย = แล้วกลายเป็นสูตร
   const keys = readRows(sh, 1).map(function (r) { return String(r[0]); });
-  const i = keys.indexOf(req.key);
+  const i = keys.indexOf(key);
   const row = i < 0 ? keys.length + 2 : i + 2;
   const need = parts.length + 1;
   if (sh.getMaxColumns() < need) sh.insertColumnsAfter(sh.getMaxColumns(), need - sh.getMaxColumns());
   sh.getRange(row, 1, 1, sh.getMaxColumns()).clearContent();
-  sh.getRange(row, 1, 1, need).setNumberFormat('@').setValues([[req.key].concat(parts)]);
+  sh.getRange(row, 1, 1, need).setNumberFormat('@').setValues([[key].concat(parts)]);
+}
+
+function setStore(req) {
+  writeStore(req.key, req.value);
   return { u: bump('store_' + req.key) };
+}
+
+/**
+ * ซิงค์ทุกอย่างในคำขอเดียว: รับข้อมูลที่เว็บส่งมา แล้วตอบกลับเฉพาะสิ่งที่เว็บยังไม่มี
+ * req.rows / req.sums / req.stores  = ข้อมูลที่ต้องบันทึก
+ * req.have = { months:{เดือน:เวอร์ชัน}, store:{key:เวอร์ชัน} } ที่เว็บมีอยู่แล้ว
+ * req.want = เดือนที่เว็บต้องการโหลด · req.recent = เครื่องใหม่: โหลดกี่เดือนล่าสุดก่อน
+ */
+function syncAll(req) {
+  const metaSh = sheet('_meta', ['name', 'u']);
+  const M = {};
+  readRows(metaSh, 2).forEach(function (r) { M[String(r[0])] = Number(r[1]); });
+  let touched = false;
+  const now = Date.now();
+  function bumpM(n) { const u = Math.max(now, (M[n] || 0) + 1); M[n] = u; touched = true; return u; }
+
+  // 1) บันทึกข้อมูลสแกนแยกตามเดือน
+  const by = {};
+  (req.rows || []).forEach(function (r) { const m = String(r[1]).slice(0, 7); (by[m] = by[m] || []).push(r); });
+  const wrote = {};
+  Object.keys(by).forEach(function (m) {
+    const prev = M['rec_' + m] || 0;
+    upsertSheet(sheet('rec_' + m, REC_HEAD), by[m], REC_HEAD.length);
+    wrote[m] = { prev: prev, u: bumpM('rec_' + m) };
+  });
+  if (req.sums && req.sums.length) {
+    upsertSheet(sheet('_summary', SUM_HEAD), req.sums, SUM_HEAD.length);
+    req.sums.forEach(function (s) { const m = String(s[2]); if (!wrote[m]) wrote[m] = { prev: M['rec_' + m] || 0, u: bumpM('rec_' + m) }; });
+  }
+  // 2) บันทึกการตั้งค่า / กะ / ใบเตือน
+  const storeU = {};
+  Object.keys(req.stores || {}).forEach(function (k) { writeStore(k, req.stores[k]); storeU[k] = bumpM('store_' + k); });
+  if (touched) {
+    const outRows = Object.keys(M).map(function (n) { return [n, String(M[n])]; });
+    metaSh.getRange(2, 1, outRows.length, 2).setNumberFormat('@').setValues(outRows);
+  }
+
+  // 3) เลือกเฉพาะเดือนที่เว็บต้องโหลด
+  const months = {}, store = {};
+  Object.keys(M).forEach(function (n) {
+    if (n.indexOf('rec_') === 0) months[n.slice(4)] = M[n];
+    else if (n.indexOf('store_') === 0) store[n.slice(6)] = M[n];
+  });
+  const have = req.have || {}, hm = have.months || {}, hs = have.store || {};
+  const send = {};
+  (req.want || []).forEach(function (m) { if (months[m]) send[m] = 1; });
+  Object.keys(hm).forEach(function (m) {
+    if (!months[m]) return;
+    const w = wrote[m];
+    if (w && Number(hm[m]) === w.prev) return;     // เว็บเพิ่งส่งมาเอง และไม่มีใครแก้ระหว่างนั้น
+    if (Number(hm[m]) < months[m]) send[m] = 1;    // มีเครื่องอื่นแก้
+  });
+  Object.keys(wrote).forEach(function (m) { if (!(m in hm) && wrote[m].prev > 0) send[m] = 1; });
+  if (req.recent && !Object.keys(hm).length) Object.keys(months).sort().reverse().slice(0, req.recent).forEach(function (m) { send[m] = 1; });
+
+  const rows = {};
+  Object.keys(send).forEach(function (m) { const sh = ss().getSheetByName('rec_' + m); rows[m] = sh ? readRows(sh, REC_HEAD.length) : []; });
+  const sumSh = ss().getSheetByName('_summary');
+  const sums = Object.keys(send).length && sumSh ? readRows(sumSh, SUM_HEAD.length).filter(function (r) { return send[String(r[2])]; }) : [];
+  const needStore = Object.keys(store).filter(function (k) { return !storeU[k] && (Number(hs[k]) || 0) < store[k]; });
+  const storeVals = needStore.length ? getStore({ keys: needStore }).values : {};
+  return { months: months, store: store, wrote: wrote, storeU: storeU, rows: rows, sums: sums, storeVals: storeVals };
 }
